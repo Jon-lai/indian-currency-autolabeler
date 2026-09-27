@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv/
+.env
+
+# Large datasets & generated outputs
+indian_currency_640/
+dataset_640x640/
+labels*/
+previews*/
+missed*/
+errors*/
+*.jsonl
+*.csv
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
