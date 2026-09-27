@@ -40,9 +40,10 @@ DEFAULT_ERROR_DIR   = "errors"
 DEFAULT_REPORT_PATH = "annotation_report.csv"
 DEFAULT_RAW_LOG     = "raw_model_outputs.jsonl"
 
-MAX_NEW_TOKENS   = 128
-APPLY_NMS        = True
-NMS_IOU          = 0.5
+MAX_NEW_TOKENS      = 64
+DEFAULT_BATCH_SIZE  = 8
+APPLY_NMS           = True
+NMS_IOU             = 0.5
 
 # Enable TensorFloat-32 (TF32) on Ampere / Ada Lovelace (RTX 3060 / L4 / A100)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -321,12 +322,13 @@ def run_cascaded_labeler(
     target_classes=None,
     label_mode="denom",      # 'denom' -> '10_rupee_note', 'class' -> 'new10'
     mode="cascade",          # 'cascade', 'text-only', 'refs-only'
+    batch_size=DEFAULT_BATCH_SIZE,
     skip_existing=False,
     preview_count_per_class=15
 ):
     """
     Two-stage auto-labeler:
-      1. Run class-aware text prompt.
+      1. Run class-aware text prompt (batched for ultra-high throughput).
       2. If missed and in 'cascade' mode, automatically re-run with visual front & back references.
     """
     for d in (output_dir, preview_dir, missed_dir, error_dir):
@@ -349,6 +351,7 @@ def run_cascaded_labeler(
     print("=" * 70)
     print(f"Dataset root          : {dataset_dir}")
     print(f"Execution mode        : {mode.upper()}")
+    print(f"Batch size            : {batch_size}")
     print(f"References directory  : {ref_dir}")
     print(f"Classes found         : {', '.join(subdirs)} ({len(subdirs)} classes)")
     print(f"Images per class      : {num_per_class if num_per_class else 'ALL'}")
@@ -480,101 +483,143 @@ def run_cascaded_labeler(
             }
             previews_saved = 0
 
-            pbar = tqdm(img_paths, desc=f"Class [{cls:<7}]", unit="img")
-            for img_path in pbar:
-                name = os.path.basename(img_path)
-                base = os.path.splitext(name)[0]
+            pbar = tqdm(total=len(img_paths), desc=f"Class [{cls:<7}]", unit="img")
+            for batch_start in range(0, len(img_paths), batch_size):
+                batch_paths = img_paths[batch_start : batch_start + batch_size]
 
-                try:
-                    image = Image.open(img_path).convert("RGB")
-                    w, h = image.size
-                except Exception as e:
-                    print(f"  ERROR reading {name}: {e}")
-                    shutil.copy(img_path, error_dir)
-                    cls_stats["errors"] += 1
-                    rows.append((cls, name, "unreadable", "none", 0, "", ""))
+                batch_items = []
+                for img_path in batch_paths:
+                    name = os.path.basename(img_path)
+                    base = os.path.splitext(name)[0]
+                    try:
+                        image = Image.open(img_path).convert("RGB")
+                        w, h = image.size
+                        batch_items.append({
+                            "path": img_path,
+                            "name": name,
+                            "base": base,
+                            "image": image,
+                            "w": w,
+                            "h": h,
+                            "boxes": [],
+                            "method": "stage1_text",
+                            "raw": ""
+                        })
+                    except Exception as e:
+                        print(f"  ERROR reading {name}: {e}")
+                        shutil.copy(img_path, error_dir)
+                        cls_stats["errors"] += 1
+                        rows.append((cls, name, "unreadable", "none", 0, "", ""))
+
+                if not batch_items:
+                    pbar.update(len(batch_paths))
                     continue
 
-                boxes = []
-                method_used = "stage1_text"
-                raw_text = ""
-
-                # ---------------- STAGE 1: TEXT-ONLY RUN ----------------
+                # ---------------- STAGE 1: BATCHED TEXT INFERENCE ----------------
                 if mode in ("cascade", "text-only"):
-                    inputs1 = processor(text=chat_prompt_stage1, images=image, return_tensors="pt").to(model.device)
+                    batch_prompts = [chat_prompt_stage1] * len(batch_items)
+                    batch_images = [[item["image"]] for item in batch_items]
+                    inputs1 = processor(
+                        text=batch_prompts,
+                        images=batch_images,
+                        return_tensors="pt",
+                        padding=True
+                    ).to(model.device)
+
                     with torch.inference_mode():
                         out1 = model.generate(**inputs1, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
                     in_len1 = inputs1["input_ids"].shape[1]
-                    raw_text = processor.decode(out1[0][in_len1:], skip_special_tokens=True).strip()
+
+                    for idx, item in enumerate(batch_items):
+                        raw_text = processor.decode(out1[idx][in_len1:], skip_special_tokens=True).strip()
+                        item["raw"] = raw_text
+                        detections1, _ = parse_detections(raw_text)
+                        boxes = [{"box_2d": d["box_2d"], "label": lbl}
+                                 for d in detections1 if (lbl := map_label(d["label"], label_to_use))]
+                        if APPLY_NMS and len(boxes) > 1:
+                            boxes = nms(boxes)
+                        item["boxes"] = boxes
 
                     del inputs1, out1
-                    torch.cuda.empty_cache()
-
-                    detections1, _ = parse_detections(raw_text)
-                    boxes = [{"box_2d": d["box_2d"], "label": lbl}
-                             for d in detections1 if (lbl := map_label(d["label"], label_to_use))]
-                    if APPLY_NMS and len(boxes) > 1:
-                        boxes = nms(boxes)
 
                 # ---------------- STAGE 2: VISUAL REFERENCE FALLBACK ----------------
-                if (not boxes) and (mode in ("cascade", "refs-only")) and has_refs and chat_prompt_stage2:
-                    method_used = "stage2_refs"
-                    # Pass target image FIRST, followed by references
-                    inputs2 = processor(text=chat_prompt_stage2, images=[image, ref_front_img, ref_back_img], return_tensors="pt").to(model.device)
-                    with torch.inference_mode():
-                        out2 = model.generate(**inputs2, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
-                    in_len2 = inputs2["input_ids"].shape[1]
-                    raw_text = processor.decode(out2[0][in_len2:], skip_special_tokens=True).strip()
+                if mode in ("cascade", "refs-only") and has_refs and chat_prompt_stage2:
+                    for item in batch_items:
+                        if mode == "refs-only" or not item["boxes"]:
+                            item["method"] = "stage2_refs"
+                            # Pass target image FIRST, followed by references
+                            inputs2 = processor(
+                                text=chat_prompt_stage2,
+                                images=[item["image"], ref_front_img, ref_back_img],
+                                return_tensors="pt"
+                            ).to(model.device)
+                            with torch.inference_mode():
+                                out2 = model.generate(**inputs2, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
+                            in_len2 = inputs2["input_ids"].shape[1]
+                            raw_text2 = processor.decode(out2[0][in_len2:], skip_special_tokens=True).strip()
+                            item["raw"] = raw_text2
 
-                    del inputs2, out2
-                    torch.cuda.empty_cache()
+                            del inputs2, out2
 
-                    detections2, _ = parse_detections(raw_text)
-                    boxes = [{"box_2d": d["box_2d"], "label": lbl}
-                             for d in detections2 if (lbl := map_label(d["label"], label_to_use))]
-                    if APPLY_NMS and len(boxes) > 1:
-                        boxes = nms(boxes)
+                            detections2, _ = parse_detections(raw_text2)
+                            boxes2 = [{"box_2d": d["box_2d"], "label": lbl}
+                                      for d in detections2 if (lbl := map_label(d["label"], label_to_use))]
+                            if APPLY_NMS and len(boxes2) > 1:
+                                boxes2 = nms(boxes2)
+                            item["boxes"] = boxes2
 
                 # ---------------- LOGGING & EXPORT ----------------
-                rawlog.write(json.dumps({"class": cls, "image": name, "stage": method_used, "raw": raw_text}) + "\n")
-                rawlog.flush()
+                for item in batch_items:
+                    img_path = item["path"]
+                    name = item["name"]
+                    base = item["base"]
+                    w, h = item["w"], item["h"]
+                    boxes = item["boxes"]
+                    method_used = item["method"]
+                    raw_text = item["raw"]
 
-                if boxes:
-                    create_voc_xml(
-                        image_path=img_path,
-                        width=w,
-                        height=h,
-                        objects=boxes,
-                        output_xml_path=os.path.join(cls_out_dir, f"{base}.xml"),
-                        folder_name=cls
-                    )
-                    if method_used == "stage1_text":
-                        cls_stats["stage1_det"] += 1
-                    else:
-                        cls_stats["stage2_det"] += 1
+                    rawlog.write(json.dumps({"class": cls, "image": name, "stage": method_used, "raw": raw_text}) + "\n")
 
-                    cls_stats["total_det"] += 1
-                    cls_stats["notes"] += len(boxes)
-                    labels_str = ";".join(b["label"] for b in boxes)
-                    rows.append((cls, name, "annotated", method_used, len(boxes), labels_str, raw_text))
-
-                    if previews_saved < preview_count_per_class:
-                        save_preview(
-                            img_path,
-                            boxes,
-                            os.path.join(cls_preview_dir, f"{base}.jpg"),
-                            color=bgr_color
+                    if boxes:
+                        create_voc_xml(
+                            image_path=img_path,
+                            width=w,
+                            height=h,
+                            objects=boxes,
+                            output_xml_path=os.path.join(cls_out_dir, f"{base}.xml"),
+                            folder_name=cls
                         )
-                        previews_saved += 1
-                else:
-                    shutil.copy(img_path, cls_missed_dir)
-                    cls_stats["missed"] += 1
-                    rows.append((cls, name, "not_detected", method_used, 0, "", raw_text))
+                        if method_used == "stage1_text":
+                            cls_stats["stage1_det"] += 1
+                        else:
+                            cls_stats["stage2_det"] += 1
 
+                        cls_stats["total_det"] += 1
+                        cls_stats["notes"] += len(boxes)
+                        labels_str = ";".join(b["label"] for b in boxes)
+                        rows.append((cls, name, "annotated", method_used, len(boxes), labels_str, raw_text))
+
+                        if previews_saved < preview_count_per_class:
+                            save_preview(
+                                img_path,
+                                boxes,
+                                os.path.join(cls_preview_dir, f"{base}.jpg"),
+                                color=bgr_color
+                            )
+                            previews_saved += 1
+                    else:
+                        shutil.copy(img_path, cls_missed_dir)
+                        cls_stats["missed"] += 1
+                        rows.append((cls, name, "not_detected", method_used, 0, "", raw_text))
+
+                rawlog.flush()
+                pbar.update(len(batch_paths))
                 pct = 100 * cls_stats["total_det"] / max(cls_stats["total_det"] + cls_stats["missed"], 1)
                 pbar.set_postfix_str(f"det: {cls_stats['total_det']}/{len(img_paths)} ({pct:.0f}%) | s1:{cls_stats['stage1_det']} s2:{cls_stats['stage2_det']}")
 
             pbar.close()
+            # Clean up GPU memory once per class (avoids device synchronization overhead in hot loop)
+            torch.cuda.empty_cache()
             overall_stats["by_class"][cls] = cls_stats
             overall_stats["processed"] += cls_stats["count"]
             overall_stats["stage1_text_det"] += cls_stats["stage1_det"]
@@ -630,6 +675,8 @@ if __name__ == "__main__":
     parser.add_argument("--classes", nargs="+", default=None, help="Specific classes to run (e.g. --classes new10 old10)")
     parser.add_argument("--label-mode", type=str, default="denom", choices=["denom", "class"],
                         help="'denom' for 10_rupee_note, 'class' for new10/old10")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                        help=f"Batch size for Stage 1 inference (default {DEFAULT_BATCH_SIZE}, recommended 8 or 16 on L4 GPU)")
     parser.add_argument("--skip-existing", action="store_true", default=False, help="Skip images with existing XMLs")
     parser.add_argument("--preview-count-per-class", type=int, default=15, help="Previews to save per class")
 
@@ -648,6 +695,7 @@ if __name__ == "__main__":
         target_classes=args.classes,
         label_mode=args.label_mode,
         mode=args.mode,
+        batch_size=args.batch_size,
         skip_existing=args.skip_existing,
         preview_count_per_class=args.preview_count_per_class
     )
