@@ -81,8 +81,8 @@ The pipeline uses a two-stage cascade combining maximum bounding box precision w
 
 ### 2. Clone the Repository
 ```bash
-!git clone https://github.com/Jon-lai/<repo-name>.git
-%cd <repo-name>
+!git clone https://github.com/Jon-lai/indian-currency-autolabeler.git
+%cd indian-currency-autolabeler
 ```
 
 ### 3. Install Dependencies
